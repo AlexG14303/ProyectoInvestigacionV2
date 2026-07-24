@@ -1,0 +1,138 @@
+services:
+  # API Gateway liviano para el laboratorio.
+  # Dashboard: http://localhost:8080
+  traefik:
+    image: traefik:v3.6
+    container_name: traefik-followup
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "8080:8080"
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - followup-net
+
+  # Base de datos PostgreSQL para la tabla followup_records.
+  postgres:
+    image: postgres:15
+    container_name: postgres-followup
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: followup
+      POSTGRES_PASSWORD: followup123
+      POSTGRES_DB: followupdb
+    command: ["postgres", "-c", "max_connections=200"]
+    volumes:
+      - followup_pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U followup -d followupdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - followup-net
+
+  # PostgREST expone la tabla de PostgreSQL como API interna.
+  postgrest:
+    image: postgrest/postgrest:v12.2.0
+    container_name: postgrest-followup
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PGRST_DB_URI: postgresql://followup:followup123@postgres:5432/followupdb
+      PGRST_DB_SCHEMA: public
+      PGRST_DB_ANON_ROLE: web_anon
+      PGRST_SERVER_PORT: 3000
+      PGRST_DB_POOL: 80
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - followup-net
+
+  # Microservicio asignado: community-followup-service.
+  community-followup-service:
+    build:
+      context: .
+      dockerfile: community-followup-service/Dockerfile
+    container_name: community-followup-service
+    restart: unless-stopped
+    # ---- Límite de núcleos físicos/lógicos usados por el contenedor ----
+    # Independiente de OMP_NUM_THREADS/BACKEND_THREADS: aquellos son límites
+    # de SOFTWARE (cuántos hilos crea el programa); esto es un límite de
+    # KERNEL (a qué CPUs concretas tiene permitido correr el contenedor).
+    # Por defecto usa las 12 CPUs lógicas de esta máquina (6 núcleos físicos
+    # x 2 hilos SMT) — es decir, SIN restricción, igual que antes de agregar
+    # esta línea. Fíjelo explícitamente solo para el experimento aparte de
+    # "cuántos núcleos físicos hacen falta" (ver README_OPENMP_SINGLE_INSERT.md);
+    # para las corridas grandes de JMeter, déjelo en el valor por defecto.
+    #
+    # cpuset  = A CUÁLES CPUs concretas puede correr el contenedor (afinidad).
+    #           Es lo que hace que "nproc" adentro del contenedor cambie.
+    # cpus (deploy.resources.limits) = CUÁNTO tiempo de cómputo puede
+    #           consumir en total, como cuota fraccionaria (equivalente a
+    #           --cpus de "docker run"). Es un límite complementario, no
+    #           redundante: aunque el contenedor tenga acceso a 4 CPUs vía
+    #           cpuset, esta cuota puede topar el uso real a, por ejemplo,
+    #           2.5 núcleos-tiempo dentro de esas 4. Por defecto en 12
+    #           (= sin restricción real en esta máquina).
+    cpuset: ${CPU_SET:-0-11}
+    deploy:
+      resources:
+        limits:
+          cpus: "${CPU_LIMIT:-12}"
+    environment:
+      POSTGREST_HOST: postgrest
+      POSTGREST_PORT: 3000
+      FOLLOWUP_TABLE: followup_records
+      PORT: 8084
+
+      # ---- Paralelismo interno OpenMP (dentro de CADA request) ----
+      # Nivel experimental: 1, 2, 4, 6 u 8. Se fija antes de levantar Docker:
+      #   OMP_NUM_THREADS=4 BACKEND_THREADS=1 CF_PARALLELISM_LEVEL=p04 docker compose up --build -d
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+      OMP_DYNAMIC: "FALSE"
+      OMP_MAX_ACTIVE_LEVELS: ${OMP_MAX_ACTIVE_LEVELS:-1}
+      OMP_PROC_BIND: ${OMP_PROC_BIND:-TRUE}
+      OMP_PLACES: ${OMP_PLACES:-cores}
+
+      # Etiqueta puramente informativa para /health y las métricas de los
+      # endpoints de lote (no controla ningún hilo por sí misma).
+      CF_PARALLELISM_LEVEL: ${CF_PARALLELISM_LEVEL:-p01}
+
+      # ---- Concurrencia HTTP (independiente de OpenMP) ----
+      # Cuántas requests se atienden en simultáneo. Para medir OpenMP "puro"
+      # déjelo en 1; para medir concurrencia + paralelismo combinados, súbalo
+      # junto con OMP_NUM_THREADS (documentado en README_OPENMP_SINGLE_INSERT.md).
+      BACKEND_THREADS: ${BACKEND_THREADS:-1}
+
+      # ---- Umbral para evitar overhead en lotes pequeños ----
+      MIN_PARALLEL_BATCH_SIZE: ${MIN_PARALLEL_BATCH_SIZE:-100}
+
+      # ---- Tamaño de bloque para la fase de persistencia controlada ----
+      PERSIST_CHUNK_SIZE: ${PERSIST_CHUNK_SIZE:-500}
+    ports:
+      - "8084:8084"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.followups.rule=PathPrefix(`/followups`) || PathPrefix(`/followup`) || PathPrefix(`/compliance`)"
+      - "traefik.http.routers.followups.entrypoints=web"
+      - "traefik.http.services.followups.loadbalancer.server.port=8084"
+    depends_on:
+      postgrest:
+        condition: service_started
+    networks:
+      - followup-net
+
+volumes:
+  followup_pgdata:
+
+networks:
+  followup-net:
+    driver: bridge

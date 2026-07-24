@@ -1,0 +1,4 @@
+message_broker:
+  enabled: false
+  provider: rabbitmq
+  note: "Preparado para integración futura con los demás microservicios APS."

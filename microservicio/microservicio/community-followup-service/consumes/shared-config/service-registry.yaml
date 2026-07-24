@@ -1,0 +1,8 @@
+services:
+  community-followup-service:
+    host: community-followup-service
+    port: 8084
+    base_paths:
+      - /followups
+      - /followup
+      - /compliance

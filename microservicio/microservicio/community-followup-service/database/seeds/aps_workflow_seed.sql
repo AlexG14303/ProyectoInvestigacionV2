@@ -1,0 +1,1 @@
+-- Estados sugeridos para el flujo APS: PARCIAL, SI_CUMPLE, NO_CUMPLE.

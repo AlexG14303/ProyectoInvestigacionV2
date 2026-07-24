@@ -1,0 +1,9 @@
+policy: followup-policy
+resources:
+  - followup_records
+allowed_operations:
+  - create
+  - read
+  - update
+  - delete
+  - complete

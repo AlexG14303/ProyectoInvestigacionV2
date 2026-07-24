@@ -1,0 +1,8 @@
+workflow:
+  default_status: PARCIAL
+  completion_status: SI_CUMPLE
+  alert_status: NO_CUMPLE
+  allowed_statuses:
+    - SI_CUMPLE
+    - PARCIAL
+    - NO_CUMPLE

@@ -1,0 +1,13 @@
+events:
+  - name: followup.created
+    producer: community-followup-service
+    schema: schemas/followup-events.json
+  - name: followup.updated
+    producer: community-followup-service
+    schema: schemas/followup-events.json
+  - name: followup.completed
+    producer: community-followup-service
+    schema: schemas/followup-events.json
+  - name: compliance.alert
+    producer: community-followup-service
+    schema: schemas/followup-events.json

@@ -1,0 +1,8 @@
+audit:
+  service: community-followup-service
+  events:
+    - create_followup
+    - update_followup
+    - complete_followup
+    - delete_followup
+    - compliance_alert

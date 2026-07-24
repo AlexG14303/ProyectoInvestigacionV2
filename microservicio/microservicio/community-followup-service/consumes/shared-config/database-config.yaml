@@ -1,0 +1,9 @@
+database:
+  engine: postgresql
+  host: postgres
+  port: 5432
+  database: followupdb
+  table: followup_records
+postgrest:
+  host: postgrest
+  port: 3000

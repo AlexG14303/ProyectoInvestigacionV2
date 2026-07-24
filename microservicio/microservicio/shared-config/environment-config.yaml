@@ -1,0 +1,2 @@
+environment: docker-lab
+service: community-followup-service

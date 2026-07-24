@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FollowupEvent",
+  "type": "object",
+  "required": ["event", "followup_id", "family_id"],
+  "properties": {
+    "event": {"enum": ["followup.created", "followup.updated", "followup.completed", "compliance.alert"]},
+    "followup_id": {"type": "integer"},
+    "family_id": {"type": "integer"},
+    "compliance_status": {"enum": ["SI_CUMPLE", "PARCIAL", "NO_CUMPLE"]}
+  }
+}
