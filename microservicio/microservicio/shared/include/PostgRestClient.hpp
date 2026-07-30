@@ -44,6 +44,17 @@
 // comparte vía shared_ptr) — si en el futuro se crea más de una instancia,
 // esta estrategia thread_local tendría que revisarse.
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Excepción dedicada para errores de PostgRestClient, en vez de lanzar
+// std::runtime_error genérico directamente. Esto permite que el código que
+// llama distinga "algo falló hablando con PostgREST" de cualquier otro
+// runtime_error del programa, con un catch específico si hace falta.
+// ─────────────────────────────────────────────────────────────────────────────
+class PostgRestError : public std::runtime_error {
+public:
+    explicit PostgRestError(const std::string& message) : std::runtime_error(message) {}
+};
+
 class PostgRestClient {
 public:
     PostgRestClient(const std::string& host, int port,
@@ -78,11 +89,14 @@ public:
         h.emplace("Prefer", "return=representation");
         auto res = cli.Post("/" + table, h, data.dump(), "application/json");
         if (!res || (res->status != 200 && res->status != 201)) {
-            throw std::runtime_error(
+            // NOSONAR (std::format, S6185): requiere GCC 13+; el Dockerfile
+            // usa ubuntu:22.04, que trae GCC 11.4 por defecto — std::format
+            // no compilaría. Se mantiene la concatenación manual.
+            throw PostgRestError(
                 "PostgREST insert error [" + table + "]: " +
-                (res ? std::to_string(res->status) + " — " + res->body
+                (res ? std::to_string(res->status) + " — " + res->body  // NOSONAR
                      : "sin respuesta (timeout o conexión rechazada tras " +
-                           std::to_string(connectTimeoutSec_) + "s)"));
+                           std::to_string(connectTimeoutSec_) + "s)"));  // NOSONAR
         }
         auto result = nlohmann::json::parse(res->body);
         if (result.is_array() && !result.empty()) return result[0];
@@ -101,11 +115,13 @@ public:
         h.emplace("Prefer", "return=representation");
         auto res = cli.Post("/" + table, h, dataArray.dump(), "application/json");
         if (!res || (res->status != 200 && res->status != 201)) {
-            throw std::runtime_error(
+            // NOSONAR (std::format, S6185): mismo motivo que en insert() —
+            // GCC 11.4 (Ubuntu 22.04) no soporta std::format.
+            throw PostgRestError(
                 "PostgREST bulk insert error [" + table + "]: " +
-                (res ? std::to_string(res->status) + " — " + res->body
+                (res ? std::to_string(res->status) + " — " + res->body  // NOSONAR
                      : "sin respuesta (timeout o conexión rechazada tras " +
-                           std::to_string(connectTimeoutSec_) + "s)"));
+                           std::to_string(connectTimeoutSec_) + "s)"));  // NOSONAR
         }
         return nlohmann::json::parse(res->body);
     }
@@ -132,7 +148,7 @@ private:
     int         connectTimeoutSec_;
     int         readWriteTimeoutSec_;
 
-    httplib::Headers baseHeaders() {
+    httplib::Headers baseHeaders() const {
         return {
             {"Accept",       "application/json"},
             {"Content-Type", "application/json"}
@@ -144,8 +160,7 @@ private:
     // una conexión TCP nueva por cada operación contra PostgREST.
     httplib::Client& clientForThisThread() const {
         thread_local httplib::Client cli(host_, port_);
-        thread_local bool configured = false;
-        if (!configured) {
+        if (thread_local bool configured = false; !configured) {
             cli.set_connection_timeout(connectTimeoutSec_, 0);
             cli.set_read_timeout(readWriteTimeoutSec_, 0);
             cli.set_write_timeout(readWriteTimeoutSec_, 0);
