@@ -145,7 +145,16 @@ std::vector<json> generateSyntheticRecords(int count) {
     if (count <= 0) return records;
     records.reserve(static_cast<std::size_t>(count));
 
-    std::mt19937 rng(20260713u);  // semilla fija -> reproducible entre corridas
+    // NOSONAR: mt19937 con semilla FIJA es intencional aquí — este generador
+    // se usa exclusivamente para simular datos de prueba (endpoint
+    // ?simulate=N de /analytics/summary), nunca para nada relacionado con
+    // seguridad (no genera tokens, contraseñas, IDs de sesión ni ningún
+    // valor criptográfico). La semilla fija es justamente el punto: permite
+    // que las corridas de benchmark sean reproducibles entre ejecuciones.
+    // Un generador criptográficamente seguro (std::random_device) sería
+    // más lento y, al no ser determinista, rompería la reproducibilidad
+    // que este código busca.
+    std::mt19937 rng(20260713u);  // NOSONAR: PRNG no-criptográfico intencional, ver comentario arriba
     std::uniform_int_distribution<int> statusDist(0, 2);
     static const char* statuses[3] = {"SI_CUMPLE", "PARCIAL", "NO_CUMPLE"};
 
