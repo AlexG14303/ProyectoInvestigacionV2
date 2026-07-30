@@ -2,7 +2,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
-#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -67,7 +66,12 @@ static void jsonErrorResponse(httplib::Response& res, int status, const std::str
     res.set_content(json({{"error", message}}).dump(), "application/json");
 }
 
-static void handle(httplib::Response& res, const std::function<void()>& fn) {
+// Se convierte a template en vez de usar std::function<void()>: evita el
+// overhead de type erasure (asignación dinámica interna, indirección de
+// llamada) ya que siempre se invoca con lambdas conocidas en tiempo de
+// compilación. El compilador puede inlinear el cuerpo de "fn" directamente.
+template <typename Fn>
+static void handle(httplib::Response& res, Fn&& fn) {
     try {
         fn();
     } catch (const json::parse_error&) {
@@ -125,153 +129,194 @@ static json eventFromCModule(const std::string& eventName, const json& item) {
     return json::parse(buffer);
 }
 
+// -----------------------------------------------------------------------------
+// Handlers de registerRoutes(), extraídos a funciones nombradas.
+// Esto reduce la complejidad cognitiva de registerRoutes() (antes 43, tope
+// permitido 25) ya que registerRoutes() pasa a ser solo una lista de
+// registros de rutas, sin lógica anidada. También permite declarar la
+// captura explícita de cada lambda en vez de "[&]" implícito.
+// -----------------------------------------------------------------------------
+static void handleGetList(const std::shared_ptr<PostgRestClient>& pgClient, const std::string& table,
+                           const httplib::Request& req, httplib::Response& res) {
+    handle(res, [&pgClient, &table, &req, &res]() {
+        jsonOk(res, pgClient->getAll(table, buildListQuery(req)));
+    });
+}
+
+static void handleGetOne(const std::shared_ptr<PostgRestClient>& pgClient, const std::string& table,
+                          const httplib::Request& req, httplib::Response& res) {
+    handle(res, [&pgClient, &table, &req, &res]() {
+        int id = std::stoi(req.matches[1]);
+        auto item = pgClient->getOne(table, idFilter(id));
+        if (item.is_null()) {
+            jsonErrorResponse(res, 404, "Seguimiento no encontrado");
+            return;
+        }
+        jsonOk(res, item);
+    });
+}
+
+static void handleCreate(const std::shared_ptr<PostgRestClient>& pgClient, const std::string& table,
+                          const httplib::Request& req, httplib::Response& res) {
+    handle(res, [&pgClient, &table, &req, &res]() {
+        // 1) Validación básica (secuencial, simple).
+        auto data = cleanFollowupPayload(parseBody(req));
+
+        // 2) Evaluación interna paralela con OpenMP — ANTES de insertar.
+        //    Calcula riesgo, cumplimiento, prioridad, alertas y
+        //    recomendaciones a partir de las 80 reglas del motor. No
+        //    hace ninguna llamada de red ni de base de datos.
+        auto evaluation = cf::domain::evaluateFollowup(data);
+
+        // 3) UNA sola inserción en base de datos. El payload insertado
+        //    conserva exactamente las mismas columnas que antes (no se
+        //    persisten los campos calculados: la tabla actual no tiene
+        //    columnas para ellos — ver README_OPENMP_SINGLE_INSERT.md,
+        //    sección "qué se guarda y qué solo se retorna").
+        auto created = pgClient->insert(table, data);
+
+        // Fix: insert() SIEMPRE devuelve un objeto (nunca un arreglo:
+        // ya sea que PostgREST responda con un arreglo de 1 elemento,
+        // insert() lo desempaqueta con result[0]). El chequeo anterior
+        // (`created.is_array()`) nunca era verdadero, así que aps_event
+        // jamás se agregaba aunque el código pareciera hacerlo.
+        if (created.is_object()) {
+            created["aps_event"] = eventFromCModule("followup.created", created);
+        }
+
+        // 4) Respuesta: el registro creado + resultados de la
+        //    evaluación + métricas de paralelismo.
+        if (created.is_object()) {
+            created["risk_score"] = evaluation.riskScore;
+            created["risk_level"] = evaluation.riskLevel;
+            created["compliance_score"] = evaluation.complianceScore;
+            created["priority"] = evaluation.priority;
+            created["alerts"] = evaluation.alerts;
+            created["recommendations"] = evaluation.recommendations;
+            created["parallel_metrics"] = {
+                {"parallel_enabled", evaluation.parallelEnabled},
+                {"threads_used", evaluation.threadsUsed},
+                {"rules_evaluated", evaluation.rulesEvaluated},
+                {"rules_triggered", evaluation.rulesTriggered},
+                {"processing_time_ms", evaluation.processingTimeMs}
+            };
+        }
+        jsonCreated(res, created);
+    });
+}
+
+static void handlePatch(const std::shared_ptr<PostgRestClient>& pgClient, const std::string& table,
+                         const httplib::Request& req, httplib::Response& res) {
+    handle(res, [&pgClient, &table, &req, &res]() {
+        int id = std::stoi(req.matches[1]);
+        auto data = cleanFollowupPayload(parseBody(req), true);
+        bool ok = pgClient->update(table, idFilter(id), data);
+        if (!ok) throw std::runtime_error("No se pudo actualizar el seguimiento");
+        auto item = pgClient->getOne(table, idFilter(id));
+        if (!item.is_null()) {
+            item["timeline_state"] = cf_timeline_state_label(item.value("compliance_status", ""));
+            item["aps_event"] = eventFromCModule("followup.updated", item);
+        }
+        jsonOk(res, item.is_null() ? json({{"mensaje", "Seguimiento actualizado"}}) : item);
+    });
+}
+
+static void handleComplete(const std::shared_ptr<PostgRestClient>& pgClient, const std::string& table,
+                            const httplib::Request& req, httplib::Response& res) {
+    handle(res, [&pgClient, &table, &req, &res]() {
+        int id = std::stoi(req.matches[1]);
+        json body = req.body.empty() ? json::object() : parseBody(req);
+
+        const std::string requestedStatus = body.value("compliance_status", "");
+        const std::string workflowStatus = cf_workflow_completion_status(requestedStatus);
+        char preparedStatus[32] = {0};
+        char error[160] = {0};
+        if (!cf_prepare_compliance_status(workflowStatus.c_str(), preparedStatus, sizeof(preparedStatus), error, sizeof(error))) {
+            throw std::invalid_argument(error);
+        }
+
+        json data = json::object();
+        data["compliance_status"] = preparedStatus;
+        data["evaluation_date"] = body.value("evaluation_date", todayIsoDate());
+        if (body.contains("noncompliance_causes")) {
+            data["noncompliance_causes"] = body["noncompliance_causes"];
+        } else if (cf_is_noncompliance_status(preparedStatus)) {
+            data["noncompliance_causes"] = cf_noncompliance_default_cause("");
+        }
+        cf::domain::validateIsoDateField(data, "evaluation_date");
+
+        bool ok = pgClient->update(table, idFilter(id), data);
+        if (!ok) throw std::runtime_error("No se pudo completar el seguimiento");
+        auto item = pgClient->getOne(table, idFilter(id));
+        if (!item.is_null()) {
+            item["timeline_state"] = cf_timeline_state_label(item.value("compliance_status", ""));
+            item["aps_event"] = eventFromCModule(cf_workflow_completion_event_name(), item);
+        }
+        jsonOk(res, item.is_null() ? json({{"mensaje", "Seguimiento completado"}}) : item);
+    });
+}
+
+static void handleClearAll(const std::shared_ptr<PostgRestClient>& pgClient, const std::string& table,
+                            httplib::Response& res) {
+    handle(res, [&pgClient, &table, &res]() {
+        // followup_id es la clave primaria y nunca es NULL,
+        // por lo que este filtro selecciona todos los registros.
+        bool ok = pgClient->remove(
+            table,
+            "followup_id=not.is.null"
+        );
+
+        if (!ok) {
+            throw std::runtime_error(
+                "No se pudo vaciar la tabla de seguimientos"
+            );
+        }
+
+        jsonOk(res, {
+            {"mensaje", "Tabla de seguimientos vaciada correctamente"}
+        });
+    });
+}
+
+static void handleDeleteOne(const std::shared_ptr<PostgRestClient>& pgClient, const std::string& table,
+                             const httplib::Request& req, httplib::Response& res) {
+    handle(res, [&pgClient, &table, &req, &res]() {
+        int id = std::stoi(req.matches[1]);
+        bool ok = pgClient->remove(table, idFilter(id));
+        if (!ok) throw std::runtime_error("No se pudo eliminar el seguimiento");
+        jsonOk(res, {{"mensaje", "Seguimiento eliminado"}, {"followup_id", id}});
+    });
+}
+
 static void registerRoutes(httplib::Server& svr, const std::shared_ptr<PostgRestClient>& pgClient, const std::string& table, const std::string& basePath) {
     svr.Get(basePath.c_str(), [pgClient, table](const httplib::Request& req, httplib::Response& res) {
-        handle(res, [&]() {
-            jsonOk(res, pgClient->getAll(table, buildListQuery(req)));
-        });
+        handleGetList(pgClient, table, req, res);
     });
 
     svr.Get((basePath + R"(/(\d+))").c_str(), [pgClient, table](const httplib::Request& req, httplib::Response& res) {
-        handle(res, [&]() {
-            int id = std::stoi(req.matches[1]);
-            auto item = pgClient->getOne(table, idFilter(id));
-            if (item.is_null()) {
-                jsonErrorResponse(res, 404, "Seguimiento no encontrado");
-                return;
-            }
-            jsonOk(res, item);
-        });
+        handleGetOne(pgClient, table, req, res);
     });
 
     svr.Post(basePath.c_str(), [pgClient, table](const httplib::Request& req, httplib::Response& res) {
-        handle(res, [&]() {
-            // 1) Validación básica (secuencial, simple).
-            auto data = cleanFollowupPayload(parseBody(req));
-
-            // 2) Evaluación interna paralela con OpenMP — ANTES de insertar.
-            //    Calcula riesgo, cumplimiento, prioridad, alertas y
-            //    recomendaciones a partir de las 80 reglas del motor. No
-            //    hace ninguna llamada de red ni de base de datos.
-            auto evaluation = cf::domain::evaluateFollowup(data);
-
-            // 3) UNA sola inserción en base de datos. El payload insertado
-            //    conserva exactamente las mismas columnas que antes (no se
-            //    persisten los campos calculados: la tabla actual no tiene
-            //    columnas para ellos — ver README_OPENMP_SINGLE_INSERT.md,
-            //    sección "qué se guarda y qué solo se retorna").
-            auto created = pgClient->insert(table, data);
-
-            // Fix: insert() SIEMPRE devuelve un objeto (nunca un arreglo:
-            // ya sea que PostgREST responda con un arreglo de 1 elemento,
-            // insert() lo desempaqueta con result[0]). El chequeo anterior
-            // (`created.is_array()`) nunca era verdadero, así que aps_event
-            // jamás se agregaba aunque el código pareciera hacerlo.
-            if (created.is_object()) {
-                created["aps_event"] = eventFromCModule("followup.created", created);
-            }
-
-            // 4) Respuesta: el registro creado + resultados de la
-            //    evaluación + métricas de paralelismo.
-            if (created.is_object()) {
-                created["risk_score"] = evaluation.riskScore;
-                created["risk_level"] = evaluation.riskLevel;
-                created["compliance_score"] = evaluation.complianceScore;
-                created["priority"] = evaluation.priority;
-                created["alerts"] = evaluation.alerts;
-                created["recommendations"] = evaluation.recommendations;
-                created["parallel_metrics"] = {
-                    {"parallel_enabled", evaluation.parallelEnabled},
-                    {"threads_used", evaluation.threadsUsed},
-                    {"rules_evaluated", evaluation.rulesEvaluated},
-                    {"rules_triggered", evaluation.rulesTriggered},
-                    {"processing_time_ms", evaluation.processingTimeMs}
-                };
-            }
-            jsonCreated(res, created);
-        });
+        handleCreate(pgClient, table, req, res);
     });
 
     svr.Patch((basePath + R"(/(\d+))").c_str(), [pgClient, table](const httplib::Request& req, httplib::Response& res) {
-        handle(res, [&]() {
-            int id = std::stoi(req.matches[1]);
-            auto data = cleanFollowupPayload(parseBody(req), true);
-            bool ok = pgClient->update(table, idFilter(id), data);
-            if (!ok) throw std::runtime_error("No se pudo actualizar el seguimiento");
-            auto item = pgClient->getOne(table, idFilter(id));
-            if (!item.is_null()) {
-                item["timeline_state"] = cf_timeline_state_label(item.value("compliance_status", ""));
-                item["aps_event"] = eventFromCModule("followup.updated", item);
-            }
-            jsonOk(res, item.is_null() ? json({{"mensaje", "Seguimiento actualizado"}}) : item);
-        });
+        handlePatch(pgClient, table, req, res);
     });
 
     svr.Post((basePath + R"(/(\d+)/complete)").c_str(), [pgClient, table](const httplib::Request& req, httplib::Response& res) {
-        handle(res, [&]() {
-            int id = std::stoi(req.matches[1]);
-            json body = req.body.empty() ? json::object() : parseBody(req);
-
-            const std::string requestedStatus = body.value("compliance_status", "");
-            const std::string workflowStatus = cf_workflow_completion_status(requestedStatus);
-            char preparedStatus[32] = {0};
-            char error[160] = {0};
-            if (!cf_prepare_compliance_status(workflowStatus.c_str(), preparedStatus, sizeof(preparedStatus), error, sizeof(error))) {
-                throw std::invalid_argument(error);
-            }
-
-            json data = json::object();
-            data["compliance_status"] = preparedStatus;
-            data["evaluation_date"] = body.value("evaluation_date", todayIsoDate());
-            if (body.contains("noncompliance_causes")) {
-                data["noncompliance_causes"] = body["noncompliance_causes"];
-            } else if (cf_is_noncompliance_status(preparedStatus)) {
-                data["noncompliance_causes"] = cf_noncompliance_default_cause("");
-            }
-            cf::domain::validateIsoDateField(data, "evaluation_date");
-
-            bool ok = pgClient->update(table, idFilter(id), data);
-            if (!ok) throw std::runtime_error("No se pudo completar el seguimiento");
-            auto item = pgClient->getOne(table, idFilter(id));
-            if (!item.is_null()) {
-                item["timeline_state"] = cf_timeline_state_label(item.value("compliance_status", ""));
-                item["aps_event"] = eventFromCModule(cf_workflow_completion_event_name(), item);
-            }
-            jsonOk(res, item.is_null() ? json({{"mensaje", "Seguimiento completado"}}) : item);
-        });
+        handleComplete(pgClient, table, req, res);
     });
 
-// Vaciar completamente la tabla de seguimientos
-svr.Delete((basePath + "/clear").c_str(),
-    [pgClient, table](const httplib::Request&, httplib::Response& res) {
-        handle(res, [&]() {
-
-            // followup_id es la clave primaria y nunca es NULL,
-            // por lo que este filtro selecciona todos los registros.
-            bool ok = pgClient->remove(
-                table,
-                "followup_id=not.is.null"
-            );
-
-            if (!ok) {
-                throw std::runtime_error(
-                    "No se pudo vaciar la tabla de seguimientos"
-                );
-            }
-
-            jsonOk(res, {
-                {"mensaje", "Tabla de seguimientos vaciada correctamente"}
-            });
+    // Vaciar completamente la tabla de seguimientos
+    svr.Delete((basePath + "/clear").c_str(),
+        [pgClient, table](const httplib::Request&, httplib::Response& res) {
+            handleClearAll(pgClient, table, res);
         });
-    });
 
     svr.Delete((basePath + R"(/(\d+))").c_str(), [pgClient, table](const httplib::Request& req, httplib::Response& res) {
-        handle(res, [&]() {
-            int id = std::stoi(req.matches[1]);
-            bool ok = pgClient->remove(table, idFilter(id));
-            if (!ok) throw std::runtime_error("No se pudo eliminar el seguimiento");
-            jsonOk(res, {{"mensaje", "Seguimiento eliminado"}, {"followup_id", id}});
-        });
+        handleDeleteOne(pgClient, table, req, res);
     });
 }
 
@@ -319,195 +364,230 @@ static json buildBatchValidateResponse(const cf::parallel::BatchProcessResult& r
         {"sample_errors", sampleErrors}};
 }
 
-int main() {
-    try{
-    const std::string pgHost = env("POSTGREST_HOST", "localhost");
-    const int pgPort = std::atoi(env("POSTGREST_PORT", "3000"));
-    const int port = std::atoi(env("PORT", "8084"));
-    const std::string table = env("FOLLOWUP_TABLE", cf_followup_table_name());
-    const auto& parallelCfg = cf::parallel::config();
-
-    auto pgClient = std::make_shared<PostgRestClient>(pgHost, pgPort);
-    httplib::Server svr;
-
-    // BACKEND_THREADS: concurrencia HTTP (independiente de OpenMP).
-    svr.new_task_queue = [threads = parallelCfg.backendThreads] {
-        return new httplib::ThreadPool(static_cast<size_t>(threads));
-    };
-
-    svr.Get("/health", [pgHost, pgPort, table, &parallelCfg](const httplib::Request&, httplib::Response& res) {
-        jsonOk(res, {
-            {"status", "ok"},
-            {"service", "community-followup-service"},
-            {"architecture", "hibrida C/C++ con OpenMP — evaluacion paralela por seguimiento, insercion unica"},
-            {"table", table},
-            {"postgrest", pgHost + ":" + std::to_string(pgPort)},
-            {"openmp", {
-                {"enabled", true},
-                {"version", _OPENMP},
-                {"omp_num_threads_configured", parallelCfg.ompNumThreads},
-                {"omp_max_threads_runtime", omp_get_max_threads()},
-                {"dynamic", static_cast<bool>(omp_get_dynamic())},
-                {"max_active_levels", parallelCfg.ompMaxActiveLevels},
-                {"proc_bind", parallelCfg.ompProcBind},
-                {"places", parallelCfg.ompPlaces},
-                {"parallelism_label", parallelCfg.parallelismLabel}
-            }},
-            {"backend_threads", parallelCfg.backendThreads},
-            {"evaluation_engine", {
-                {"enabled", true},
-                {"rules_configured", cf::domain::totalRuleCount()},
-                {"mode", "single_insert_parallel_evaluation"}
-            }},
-            {"batch_endpoints", {
-                {"note", "disponibles como herramientas secundarias; NO son la prueba principal"},
-                {"parallel_threshold", parallelCfg.minParallelBatchSize},
-                {"persist_chunk_size", parallelCfg.persistChunkSize}
-            }}
-        });
+// -----------------------------------------------------------------------------
+// Handlers de las rutas registradas directamente en main(), extraídos a
+// funciones nombradas por la misma razón que en registerRoutes(): reduce la
+// complejidad cognitiva de main() (antes 33, tope permitido 25).
+// -----------------------------------------------------------------------------
+static void handleHealth(const std::string& pgHost, int pgPort, const std::string& table,
+                          const cf::parallel::ParallelConfig& parallelCfg, httplib::Response& res) {
+    jsonOk(res, {
+        {"status", "ok"},
+        {"service", "community-followup-service"},
+        {"architecture", "hibrida C/C++ con OpenMP — evaluacion paralela por seguimiento, insercion unica"},
+        {"table", table},
+        {"postgrest", pgHost + ":" + std::to_string(pgPort)},
+        {"openmp", {
+            {"enabled", true},
+            {"version", _OPENMP},
+            {"omp_num_threads_configured", parallelCfg.ompNumThreads},
+            {"omp_max_threads_runtime", omp_get_max_threads()},
+            {"dynamic", static_cast<bool>(omp_get_dynamic())},
+            {"max_active_levels", parallelCfg.ompMaxActiveLevels},
+            {"proc_bind", parallelCfg.ompProcBind},
+            {"places", parallelCfg.ompPlaces},
+            {"parallelism_label", parallelCfg.parallelismLabel}
+        }},
+        {"backend_threads", parallelCfg.backendThreads},
+        {"evaluation_engine", {
+            {"enabled", true},
+            {"rules_configured", cf::domain::totalRuleCount()},
+            {"mode", "single_insert_parallel_evaluation"}
+        }},
+        {"batch_endpoints", {
+            {"note", "disponibles como herramientas secundarias; NO son la prueba principal"},
+            {"parallel_threshold", parallelCfg.minParallelBatchSize},
+            {"persist_chunk_size", parallelCfg.persistChunkSize}
+        }}
     });
+}
 
-    svr.Get(cf_compliance_alerts_path(), [pgClient, table](const httplib::Request&, httplib::Response& res) {
-        handle(res, [&]() {
-            jsonOk(res, pgClient->getAll(table, cf_compliance_alert_filter()));
-        });
+static void handleComplianceAlerts(const std::shared_ptr<PostgRestClient>& pgClient, const std::string& table,
+                                    httplib::Response& res) {
+    handle(res, [&pgClient, &table, &res]() {
+        jsonOk(res, pgClient->getAll(table, cf_compliance_alert_filter()));
     });
+}
 
-    // -------------------------------------------------------------------
-    // A. POST /followups/batch/validate — mide CPU puro con OpenMP.
-    // Valida + normaliza + clasifica un lote completo; NO inserta nada.
-    // -------------------------------------------------------------------
-    svr.Post("/followups/batch/validate", [](const httplib::Request& req, httplib::Response& res) {
-        handle(res, [&]() {
-            json body = parseBody(req);
-            auto raw = extractRecordsArray(body);
-            auto result = cf::parallel::processBatchCpuPhase(raw, false);
-            jsonOk(res, buildBatchValidateResponse(result));
-        });
+// -------------------------------------------------------------------
+// A. POST /followups/batch/validate — mide CPU puro con OpenMP.
+// Valida + normaliza + clasifica un lote completo; NO inserta nada.
+// -------------------------------------------------------------------
+static void handleBatchValidate(const httplib::Request& req, httplib::Response& res) {
+    handle(res, [&req, &res]() {
+        json body = parseBody(req);
+        auto raw = extractRecordsArray(body);
+        auto result = cf::parallel::processBatchCpuPhase(raw, false);
+        jsonOk(res, buildBatchValidateResponse(result));
     });
+}
 
-    // -------------------------------------------------------------------
-    // B. POST /followups/batch — ingreso por lotes de verdad.
-    // Fase 2 (paralela, CPU): validar/normalizar/clasificar.
-    // Fase 3 (secuencial, controlada): insertar en PostgREST en bloques
-    // (PERSIST_CHUNK_SIZE), FUERA de la región OpenMP.
-    // -------------------------------------------------------------------
-    svr.Post("/followups/batch", [pgClient, table](const httplib::Request& req, httplib::Response& res) {
-        handle(res, [&]() {
-            json body = parseBody(req);
-            auto raw = extractRecordsArray(body);
+// -------------------------------------------------------------------
+// B. POST /followups/batch — ingreso por lotes de verdad.
+// Fase 2 (paralela, CPU): validar/normalizar/clasificar.
+// Fase 3 (secuencial, controlada): insertar en PostgREST en bloques
+// (PERSIST_CHUNK_SIZE), FUERA de la región OpenMP.
+// -------------------------------------------------------------------
+static void handleBatchInsert(const std::shared_ptr<PostgRestClient>& pgClient, const std::string& table,
+                               const httplib::Request& req, httplib::Response& res) {
+    handle(res, [&pgClient, &table, &req, &res]() {
+        json body = parseBody(req);
+        auto raw = extractRecordsArray(body);
 
-            auto result = cf::parallel::processBatchCpuPhase(raw, false);
+        auto result = cf::parallel::processBatchCpuPhase(raw, false);
 
-            const auto& cfg = cf::parallel::config();
-            const auto tPersistStart = std::chrono::steady_clock::now();
+        const auto& cfg = cf::parallel::config();
+        const auto tPersistStart = std::chrono::steady_clock::now();
 
-            json validRecords = json::array();
-            for (auto& item : result.items) {
-                if (item.valid) validRecords.push_back(item.normalized);
-            }
+        json validRecords = json::array();
+        for (auto& item : result.items) {
+            if (item.valid) validRecords.push_back(item.normalized);
+        }
 
-            long inserted = 0;
-            json insertErrors = json::array();
-            const std::size_t chunkSize = static_cast<std::size_t>(std::max(1, cfg.persistChunkSize));
+        long inserted = 0;
+        json insertErrors = json::array();
+        const std::size_t chunkSize = static_cast<std::size_t>(std::max(1, cfg.persistChunkSize));
 
-            for (std::size_t start = 0; start < validRecords.size(); start += chunkSize) {
-                const std::size_t end = std::min(start + chunkSize, validRecords.size());
-                json chunk = json::array();
-                for (std::size_t k = start; k < end; ++k) chunk.push_back(validRecords[k]);
+        for (std::size_t start = 0; start < validRecords.size(); start += chunkSize) {
+            const std::size_t end = std::min(start + chunkSize, validRecords.size());
+            json chunk = json::array();
+            for (std::size_t k = start; k < end; ++k) chunk.push_back(validRecords[k]);
 
-                try {
-                    auto insertedChunk = pgClient->insertMany(table, chunk);
-                    if (insertedChunk.is_array()) {
-                        inserted += static_cast<long>(insertedChunk.size());
-                    } else {
-                        insertErrors.push_back("Respuesta inesperada insertando el bloque [" +
-                                                std::to_string(start) + ".." + std::to_string(end) + ")");
-                    }
-                } catch (const std::exception& e) {
-                    insertErrors.push_back("Bloque [" + std::to_string(start) + ".." + std::to_string(end) +
-                                            "): " + e.what());
+            try {
+                auto insertedChunk = pgClient->insertMany(table, chunk);
+                if (insertedChunk.is_array()) {
+                    inserted += static_cast<long>(insertedChunk.size());
+                } else {
+                    insertErrors.push_back("Respuesta inesperada insertando el bloque [" +
+                                            std::to_string(start) + ".." + std::to_string(end) + ")");
                 }
+            } catch (const std::exception& e) {
+                insertErrors.push_back("Bloque [" + std::to_string(start) + ".." + std::to_string(end) +
+                                        "): " + e.what());
             }
+        }
 
-            const auto tPersistEnd = std::chrono::steady_clock::now();
-            const double persistMs = std::chrono::duration<double, std::milli>(tPersistEnd - tPersistStart).count();
-            const double totalMs = result.processingTimeMs + persistMs;
+        const auto tPersistEnd = std::chrono::steady_clock::now();
+        const double persistMs = std::chrono::duration<double, std::milli>(tPersistEnd - tPersistStart).count();
+        const double totalMs = result.processingTimeMs + persistMs;
 
-            jsonOk(res, {
-                {"records_received", result.recordsReceived},
-                {"records_valid", result.recordsValid},
-                {"records_invalid", result.recordsInvalid},
-                {"records_inserted", inserted},
-                {"risk_summary", riskSummaryJson(result.riskAlto, result.riskMedio, result.riskBajo)},
-                {"parallel_enabled", result.parallelEnabled},
-                {"threads_used", result.threadsUsed},
-                {"parallelism_label", cfg.parallelismLabel},
-                {"cpu_phase_time_ms", result.processingTimeMs},
-                {"persist_phase_time_ms", persistMs},
-                {"total_time_ms", totalMs},
-                {"records_per_second", recordsPerSecond(result.recordsReceived, totalMs)},
-                {"insert_errors", insertErrors}
-            });
+        jsonOk(res, {
+            {"records_received", result.recordsReceived},
+            {"records_valid", result.recordsValid},
+            {"records_invalid", result.recordsInvalid},
+            {"records_inserted", inserted},
+            {"risk_summary", riskSummaryJson(result.riskAlto, result.riskMedio, result.riskBajo)},
+            {"parallel_enabled", result.parallelEnabled},
+            {"threads_used", result.threadsUsed},
+            {"parallelism_label", cfg.parallelismLabel},
+            {"cpu_phase_time_ms", result.processingTimeMs},
+            {"persist_phase_time_ms", persistMs},
+            {"total_time_ms", totalMs},
+            {"records_per_second", recordsPerSecond(result.recordsReceived, totalMs)},
+            {"insert_errors", insertErrors}
         });
     });
+}
 
-    // -------------------------------------------------------------------
-    // C. GET /followups/analytics/summary — resumen con reduction OpenMP.
-    // ?simulate=N genera N registros SOLO en memoria (no toca la base de
-    // datos); sin ese parametro, trae todos los registros reales via
-    // PostgREST (una sola llamada de red) y calcula el resumen en memoria.
-    // -------------------------------------------------------------------
-    svr.Get("/followups/analytics/summary", [pgClient, table](const httplib::Request& req, httplib::Response& res) {
-        handle(res, [&]() {
-            std::vector<json> records;
-            bool simulated = false;
+// -------------------------------------------------------------------
+// C. GET /followups/analytics/summary — resumen con reduction OpenMP.
+// ?simulate=N genera N registros SOLO en memoria (no toca la base de
+// datos); sin ese parametro, trae todos los registros reales via
+// PostgREST (una sola llamada de red) y calcula el resumen en memoria.
+// -------------------------------------------------------------------
+static void handleAnalyticsSummary(const std::shared_ptr<PostgRestClient>& pgClient, const std::string& table,
+                                    const httplib::Request& req, httplib::Response& res) {
+    handle(res, [&pgClient, &table, &req, &res]() {
+        std::vector<json> records;
+        bool simulated = false;
 
-            if (req.has_param("simulate")) {
-                const int n = std::max(0, std::atoi(req.get_param_value("simulate").c_str()));
-                records = cf::parallel::generateSyntheticRecords(n);
-                simulated = true;
-            } else {
-                auto all = pgClient->getAll(table, "");
-                if (all.is_array()) records.assign(all.begin(), all.end());
-            }
+        if (req.has_param("simulate")) {
+            const int n = std::max(0, std::atoi(req.get_param_value("simulate").c_str()));
+            records = cf::parallel::generateSyntheticRecords(n);
+            simulated = true;
+        } else {
+            auto all = pgClient->getAll(table, "");
+            if (all.is_array()) records.assign(all.begin(), all.end());
+        }
 
-            auto summary = cf::parallel::computeAnalyticsSummary(records);
-            const auto& cfg = cf::parallel::config();
+        auto summary = cf::parallel::computeAnalyticsSummary(records);
+        const auto& cfg = cf::parallel::config();
 
-            jsonOk(res, {
-                {"total_followups", summary.total},
-                {"completed_followups", summary.completed},
-                {"noncompliance_alerts", summary.nonCompliant},
-                {"partial_followups", summary.partial},
-                {"compliance_percentage", summary.compliancePercentage},
-                {"risk_summary", riskSummaryJson(summary.riskAlto, summary.riskMedio, summary.riskBajo)},
-                {"parallel_enabled", summary.parallelEnabled},
-                {"threads_used", summary.threadsUsed},
-                {"parallelism_label", cfg.parallelismLabel},
-                {"processing_time_ms", summary.processingTimeMs},
-                {"records_per_second", recordsPerSecond(summary.total, summary.processingTimeMs)},
-                {"simulated", simulated},
-                {"source_record_count", static_cast<long>(records.size())}
-            });
+        jsonOk(res, {
+            {"total_followups", summary.total},
+            {"completed_followups", summary.completed},
+            {"noncompliance_alerts", summary.nonCompliant},
+            {"partial_followups", summary.partial},
+            {"compliance_percentage", summary.compliancePercentage},
+            {"risk_summary", riskSummaryJson(summary.riskAlto, summary.riskMedio, summary.riskBajo)},
+            {"parallel_enabled", summary.parallelEnabled},
+            {"threads_used", summary.threadsUsed},
+            {"parallelism_label", cfg.parallelismLabel},
+            {"processing_time_ms", summary.processingTimeMs},
+            {"records_per_second", recordsPerSecond(summary.total, summary.processingTimeMs)},
+            {"simulated", simulated},
+            {"source_record_count", static_cast<long>(records.size())}
         });
     });
+}
 
-    registerRoutes(svr, pgClient, table, cf_followup_base_path());
-    registerRoutes(svr, pgClient, table, cf_followup_legacy_path());
+int main() {
+    try {
+        const std::string pgHost = env("POSTGREST_HOST", "localhost");
+        const int pgPort = std::atoi(env("POSTGREST_PORT", "3000"));
+        const int port = std::atoi(env("PORT", "8084"));
+        const std::string table = env("FOLLOWUP_TABLE", cf_followup_table_name());
+        const auto& parallelCfg = cf::parallel::config();
 
-    std::cout << "[community-followup-service] Arquitectura hibrida C/C++ con OpenMP activa\n";
-    std::cout << "[community-followup-service] Tabla PostgREST: " << table << "\n";
-    std::cout << "[community-followup-service] OMP_NUM_THREADS=" << parallelCfg.ompNumThreads
-              << "  BACKEND_THREADS=" << parallelCfg.backendThreads
-              << "  MIN_PARALLEL_BATCH_SIZE=" << parallelCfg.minParallelBatchSize
-              << "  label=" << parallelCfg.parallelismLabel << "\n";
-    std::cout << "[community-followup-service] Escuchando en :" << port << "\n";
-    std::signal(SIGTERM, handleShutdownSignal);
-    std::signal(SIGINT, handleShutdownSignal);
-    svr.listen("0.0.0.0", port);
+        auto pgClient = std::make_shared<PostgRestClient>(pgHost, pgPort);
+        httplib::Server svr;
 
-    return 0;
+        // BACKEND_THREADS: concurrencia HTTP (independiente de OpenMP).
+        // Se usa std::make_unique(...).release() en vez de "new" directo:
+        // httplib::Server::new_task_queue requiere devolver un puntero crudo
+        // (la librería toma posesión y lo libera internamente), pero
+        // make_unique dentro de un contexto con excepciones asegura que, si
+        // el constructor de ThreadPool lanzara, no queden fugas de memoria
+        // antes del release().
+        svr.new_task_queue = [threads = parallelCfg.backendThreads] {
+            return std::make_unique<httplib::ThreadPool>(static_cast<size_t>(threads)).release();
+        };
+
+        svr.Get("/health", [pgHost, pgPort, table, &parallelCfg](const httplib::Request&, httplib::Response& res) {
+            handleHealth(pgHost, pgPort, table, parallelCfg, res);
+        });
+
+        svr.Get(cf_compliance_alerts_path(), [pgClient, table](const httplib::Request&, httplib::Response& res) {
+            handleComplianceAlerts(pgClient, table, res);
+        });
+
+        svr.Post("/followups/batch/validate", [](const httplib::Request& req, httplib::Response& res) {
+            handleBatchValidate(req, res);
+        });
+
+        svr.Post("/followups/batch", [pgClient, table](const httplib::Request& req, httplib::Response& res) {
+            handleBatchInsert(pgClient, table, req, res);
+        });
+
+        svr.Get("/followups/analytics/summary", [pgClient, table](const httplib::Request& req, httplib::Response& res) {
+            handleAnalyticsSummary(pgClient, table, req, res);
+        });
+
+        registerRoutes(svr, pgClient, table, cf_followup_base_path());
+        registerRoutes(svr, pgClient, table, cf_followup_legacy_path());
+
+        std::cout << "[community-followup-service] Arquitectura hibrida C/C++ con OpenMP activa\n";
+        std::cout << "[community-followup-service] Tabla PostgREST: " << table << "\n";
+        std::cout << "[community-followup-service] OMP_NUM_THREADS=" << parallelCfg.ompNumThreads
+                  << "  BACKEND_THREADS=" << parallelCfg.backendThreads
+                  << "  MIN_PARALLEL_BATCH_SIZE=" << parallelCfg.minParallelBatchSize
+                  << "  label=" << parallelCfg.parallelismLabel << "\n";
+        std::cout << "[community-followup-service] Escuchando en :" << port << "\n";
+        std::signal(SIGTERM, handleShutdownSignal);
+        std::signal(SIGINT, handleShutdownSignal);
+        svr.listen("0.0.0.0", port);
+
+        return 0;
     } catch (const std::exception& e) {
         std::cerr << "[community-followup-service] Error fatal no controlado: " << e.what() << std::endl;
         return 1;
