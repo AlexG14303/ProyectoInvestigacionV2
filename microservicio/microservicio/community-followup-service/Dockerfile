@@ -20,6 +20,15 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Usuario no-root: si el proceso llegara a comprometerse, el atacante
+# queda limitado a los permisos de "appuser" en vez de tener root dentro
+# del contenedor (menos superficie para escapes de contenedor y para
+# tocar archivos/recursos que no le corresponden).
+RUN groupadd --system appgroup && useradd --system --gid appgroup --no-create-home appuser
+
 COPY --from=builder /app/build/community-followup-service/community-followup-service /usr/local/bin/community-followup-service
+
+USER appuser
+
 EXPOSE 8084
 CMD ["community-followup-service"]
