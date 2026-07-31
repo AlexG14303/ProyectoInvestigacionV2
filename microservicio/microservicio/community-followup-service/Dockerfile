@@ -1,7 +1,7 @@
 FROM ubuntu:22.04 AS builder
 
-RUN apt-get update && apt-get install -y \
-    cmake ninja-build build-essential \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -15,16 +15,15 @@ RUN cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 
 FROM ubuntu:22.04
 
-RUN apt-get update && apt-get install -y \
-    libgomp1 \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Usuario no-root: si el proceso llegara a comprometerse, el atacante
-# queda limitado a los permisos de "appuser" en vez de tener root dentro
-# del contenedor (menos superficie para escapes de contenedor y para
-# tocar archivos/recursos que no le corresponden).
-RUN groupadd --system appgroup && useradd --system --gid appgroup --no-create-home appuser
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    # Usuario no-root: si el proceso llegara a comprometerse, el atacante
+    # queda limitado a los permisos de "appuser" en vez de tener root
+    # dentro del contenedor (menos superficie para escapes de contenedor
+    # y para tocar archivos/recursos que no le corresponden).
+    && groupadd --system appgroup \
+    && useradd --system --gid appgroup --no-create-home appuser
 
 COPY --from=builder /app/build/community-followup-service/community-followup-service /usr/local/bin/community-followup-service
 
