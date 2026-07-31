@@ -324,7 +324,10 @@ std::string todayIsoDate() {
     // siendo la opción segura y portable aquí.
     std::string buf(32, '\0');
     std::snprintf(buf.data(), buf.size(), "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);  // NOSONAR
-    buf.resize(std::strlen(buf.c_str()));
+    // NOSONAR (cpp:S5813): "buf" parte en 32 bytes '\0' y se pasa junto
+    // con buf.size(), así que snprintf nunca escribe más allá del buffer;
+    // strlen() no puede leer fuera de sus límites.
+    buf.resize(std::strlen(buf.c_str()));  // NOSONAR
     return buf;
 }
 
