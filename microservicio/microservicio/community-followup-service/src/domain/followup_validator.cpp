@@ -1,5 +1,6 @@
 #include "followup_validator.h"
 
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -45,9 +46,14 @@ void validateStatus(const json& data) {
     if (!data["compliance_status"].is_string()) {
         throw std::invalid_argument("compliance_status debe ser texto");
     }
-    char error[160] = {0};
+    // Fix S5945 ("usar std::string en vez de un arreglo C-style"): se usa
+    // .data()/.size() (C++17) para pasarlo a la función C tal cual espera
+    // un char* + tamaño, y luego se recorta al contenido real (la función
+    // C escribe un string null-terminado más corto que el buffer).
+    std::string error(160, '\0');
     const std::string status = data["compliance_status"].get<std::string>();
-    if (!cf_validate_compliance_status(status.c_str(), error, sizeof(error))) {
+    if (!cf_validate_compliance_status(status.c_str(), error.data(), error.size())) {
+        error.resize(std::strlen(error.c_str()));
         throw std::invalid_argument(error);
     }
 }
@@ -57,9 +63,10 @@ void validateDate(const json& data, const char* field) {
     if (!data[field].is_string()) {
         throw std::invalid_argument(std::string(field) + " debe ser texto con formato YYYY-MM-DD");
     }
-    char error[160] = {0};
+    std::string error(160, '\0');
     const std::string date = data[field].get<std::string>();
-    if (!cf_validate_iso_date(date.c_str(), error, sizeof(error))) {
+    if (!cf_validate_iso_date(date.c_str(), error.data(), error.size())) {
+        error.resize(std::strlen(error.c_str()));
         throw std::invalid_argument(error);
     }
 }
@@ -83,10 +90,11 @@ json cleanAndValidateFollowup(const json& input, bool partialUpdate) {
     }
 
     if (!partialUpdate) {
-        char error[160] = {0};
-        const int hasFamilyId = data.contains("family_id") && !data["family_id"].is_null();
-        const int hasRecordNumber = data.contains("record_number") && !data["record_number"].is_null();
-        if (!cf_validate_required_create(hasFamilyId, hasRecordNumber, error, sizeof(error))) {
+        std::string error(160, '\0');
+        if (const int hasFamilyId = data.contains("family_id") && !data["family_id"].is_null(),
+                      hasRecordNumber = data.contains("record_number") && !data["record_number"].is_null();
+            !cf_validate_required_create(hasFamilyId, hasRecordNumber, error.data(), error.size())) {
+            error.resize(std::strlen(error.c_str()));
             throw std::invalid_argument(error);
         }
         if (!data.contains("compliance_status")) {
