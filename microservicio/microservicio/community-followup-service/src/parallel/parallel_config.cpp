@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <exception>
+#include <stdexcept>
 #include <string>
 
 namespace cf::parallel {
@@ -13,14 +13,16 @@ namespace {
 int positiveEnvInt(const char* key, int fallback) {
     const char* raw = std::getenv(key);
     if (!raw || !*raw) return fallback;
-    // Fix S2738 ("catch un tipo específico"): std::stoi solo puede lanzar
-    // std::invalid_argument (no es un número) o std::out_of_range (fuera
-    // de rango de int) — ambas derivan de std::exception, así que no hace
-    // falta un catch(...) genérico aquí.
+    // Fix S2738 + S1181: std::stoi solo puede lanzar std::invalid_argument
+    // (no es un número) o std::out_of_range (fuera de rango de int) — se
+    // capturan ambos tipos específicamente en vez de la base std::exception,
+    // que Sonar sigue considerando "genérica".
     try {
         const int value = std::stoi(raw);
         return value > 0 ? value : fallback;
-    } catch (const std::exception&) {
+    } catch (const std::invalid_argument&) {
+        return fallback;
+    } catch (const std::out_of_range&) {
         return fallback;
     }
 }
