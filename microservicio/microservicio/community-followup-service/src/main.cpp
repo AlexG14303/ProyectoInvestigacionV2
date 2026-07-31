@@ -20,9 +20,12 @@
 #include "PostgRestClient.hpp"
 
 extern "C" {
+#include "controllers/compliance-controller.h"
 #include "controllers/followup-controller.h"
+#include "database/db-connection.h"
 #include "database/followup-query-builder.h"
 #include "events/followup-event-publisher.h"
+#include "repositories/compliance-repository.h"
 #include "repositories/followup-repository.h"
 #include "services/followup-service.h"
 #include "validators/followup-validator.h"
@@ -235,6 +238,17 @@ static void handlePatch(const std::shared_ptr<PostgRestClient>& pgClient, const 
                          const httplib::Request& req, httplib::Response& res) {
     handle(res, [&pgClient, &table, &req, &res]() {
         int id = std::stoi(req.matches[1]);
+        // Fix R005 (S11/S14): PostgREST reporta éxito (200/204) en un
+        // UPDATE aunque el WHERE no coincida con ninguna fila (es
+        // comportamiento estándar de SQL/REST, no un error) — por eso
+        // "ok" por sí solo no distingue "se actualizó" de "el id no
+        // existía". Se verifica existencia explícitamente antes de
+        // intentar la actualización, devolviendo 404 si no existe.
+        auto existing = pgClient->getOne(table, idFilter(id));
+        if (existing.is_null()) {
+            jsonErrorResponse(res, 404, "Seguimiento no encontrado");
+            return;
+        }
         auto data = cleanFollowupPayload(parseBody(req), true);
         // Fix S6004+S112: "ok" en el init-statement del if, y excepción
         // dedicada (PostgRestError, ya definida en PostgRestClient.hpp)
@@ -295,6 +309,13 @@ static void handleComplete(const std::shared_ptr<PostgRestClient>& pgClient, con
                             const httplib::Request& req, httplib::Response& res) {
     handle(res, [&pgClient, &table, &req, &res]() {
         int id = std::stoi(req.matches[1]);
+        // Fix R005 (S11/S14): mismo motivo que en handlePatch — verificar
+        // existencia antes de intentar completar el seguimiento.
+        auto existing = pgClient->getOne(table, idFilter(id));
+        if (existing.is_null()) {
+            jsonErrorResponse(res, 404, "Seguimiento no encontrado");
+            return;
+        }
         json body = req.body.empty() ? json::object() : parseBody(req);
         jsonOk(res, completeFollowupWork(pgClient, table, id, body));
     });
@@ -321,6 +342,14 @@ static void handleDeleteOne(const std::shared_ptr<PostgRestClient>& pgClient, co
                              const httplib::Request& req, httplib::Response& res) {
     handle(res, [&pgClient, &table, &req, &res]() {
         int id = std::stoi(req.matches[1]);
+        // Fix R005 (S11/S14): mismo motivo que en handlePatch — PostgREST
+        // reporta éxito en un DELETE aunque el WHERE no matchee ninguna
+        // fila, así que se verifica existencia antes de borrar.
+        auto existing = pgClient->getOne(table, idFilter(id));
+        if (existing.is_null()) {
+            jsonErrorResponse(res, 404, "Seguimiento no encontrado");
+            return;
+        }
         if (const bool ok = pgClient->remove(table, idFilter(id)); !ok) {
             throw PostgRestError("No se pudo eliminar el seguimiento");
         }
@@ -452,6 +481,38 @@ static void handleComplianceAlerts(const std::shared_ptr<PostgRestClient>& pgCli
                                     httplib::Response& res) {
     handle(res, [&pgClient, &table, &res]() {
         jsonOk(res, pgClient->getAll(table, cf_compliance_alert_filter()));
+    });
+}
+
+// Fix R004 (S12/S13): cf_compliance_base_path() ("/compliance") estaba
+// definida en compliance-controller.c pero nunca se registraba en
+// registerRoutes()/main(), y las funciones de compliance-repository.c
+// (cf_build_noncompliance_query, cf_build_pending_query) no se usaban en
+// ningún lado — quedaban como código muerto. Este handler conecta ambas
+// piezas ya existentes: un resumen de cumplimiento que combina los
+// seguimientos en incumplimiento (NO_CUMPLE) y los pendientes (PARCIAL),
+// reutilizando exactamente la lógica de query ya definida en el
+// repositorio en vez de duplicarla o inventar un comportamiento nuevo.
+static void handleComplianceOverview(const std::shared_ptr<PostgRestClient>& pgClient, const std::string& table,
+                                      httplib::Response& res) {
+    handle(res, [&pgClient, &table, &res]() {
+        std::string noncomplianceQuery(256, '\0');
+        cf_build_noncompliance_query(noncomplianceQuery.data(), noncomplianceQuery.size());
+        noncomplianceQuery.resize(std::strlen(noncomplianceQuery.c_str()));  // NOSONAR (S5813): buffer en ceros, tamaño real pasado explícitamente
+
+        std::string pendingQuery(256, '\0');
+        cf_build_pending_query(pendingQuery.data(), pendingQuery.size());
+        pendingQuery.resize(std::strlen(pendingQuery.c_str()));  // NOSONAR (S5813): mismo motivo
+
+        auto noncompliance = pgClient->getAll(table, noncomplianceQuery);
+        auto pending = pgClient->getAll(table, pendingQuery);
+
+        jsonOk(res, {
+            {"noncompliance", noncompliance},
+            {"pending", pending},
+            {"noncompliance_count", noncompliance.is_array() ? static_cast<long>(noncompliance.size()) : 0},
+            {"pending_count", pending.is_array() ? static_cast<long>(pending.size()) : 0}
+        });
     });
 }
 
@@ -607,10 +668,16 @@ static void handleAnalyticsSummary(const std::shared_ptr<PostgRestClient>& pgCli
 
 int main() {
     try {
-        const std::string pgHost = env("POSTGREST_HOST", "localhost");
-        const int pgPort = std::atoi(env("POSTGREST_PORT", "3000"));
+        // Fix R008/R015 (S9/S12): cf_db_host_env()/cf_db_port_env()/
+        // cf_db_name_env() (db-connection.c) definían los nombres de
+        // estas variables de entorno pero nunca se usaban — main()
+        // repetía los mismos literales directamente ("POSTGREST_HOST",
+        // etc.), dejando db-connection.c como código muerto con 0% de
+        // cobertura. Ahora es la única fuente de verdad para estos nombres.
+        const std::string pgHost = env(cf_db_host_env(), "localhost");
+        const int pgPort = std::atoi(env(cf_db_port_env(), "3000"));
         const int port = std::atoi(env("PORT", "8084"));
-        const std::string table = env("FOLLOWUP_TABLE", cf_followup_table_name());
+        const std::string table = env(cf_db_name_env(), cf_followup_table_name());
         const auto& parallelCfg = cf::parallel::config();
 
         auto pgClient = std::make_shared<PostgRestClient>(pgHost, pgPort);
@@ -633,6 +700,12 @@ int main() {
 
         svr.Get(cf_compliance_alerts_path(), [pgClient, table](const httplib::Request&, httplib::Response& res) {
             handleComplianceAlerts(pgClient, table, res);
+        });
+
+        // Fix R004 (S12/S13): conectar cf_compliance_base_path() ("/compliance"),
+        // definida en compliance-controller.c pero nunca registrada.
+        svr.Get(cf_compliance_base_path(), [pgClient, table](const httplib::Request&, httplib::Response& res) {
+            handleComplianceOverview(pgClient, table, res);
         });
 
         svr.Post("/followups/batch/validate", [](const httplib::Request& req, httplib::Response& res) {
