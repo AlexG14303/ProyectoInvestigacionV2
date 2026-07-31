@@ -244,8 +244,7 @@ static void handlePatch(const std::shared_ptr<PostgRestClient>& pgClient, const 
         // "ok" por sí solo no distingue "se actualizó" de "el id no
         // existía". Se verifica existencia explícitamente antes de
         // intentar la actualización, devolviendo 404 si no existe.
-        auto existing = pgClient->getOne(table, idFilter(id));
-        if (existing.is_null()) {
+        if (auto existing = pgClient->getOne(table, idFilter(id)); existing.is_null()) {
             jsonErrorResponse(res, 404, "Seguimiento no encontrado");
             return;
         }
@@ -311,8 +310,7 @@ static void handleComplete(const std::shared_ptr<PostgRestClient>& pgClient, con
         int id = std::stoi(req.matches[1]);
         // Fix R005 (S11/S14): mismo motivo que en handlePatch — verificar
         // existencia antes de intentar completar el seguimiento.
-        auto existing = pgClient->getOne(table, idFilter(id));
-        if (existing.is_null()) {
+        if (auto existing = pgClient->getOne(table, idFilter(id)); existing.is_null()) {
             jsonErrorResponse(res, 404, "Seguimiento no encontrado");
             return;
         }
@@ -345,8 +343,7 @@ static void handleDeleteOne(const std::shared_ptr<PostgRestClient>& pgClient, co
         // Fix R005 (S11/S14): mismo motivo que en handlePatch — PostgREST
         // reporta éxito en un DELETE aunque el WHERE no matchee ninguna
         // fila, así que se verifica existencia antes de borrar.
-        auto existing = pgClient->getOne(table, idFilter(id));
-        if (existing.is_null()) {
+        if (auto existing = pgClient->getOne(table, idFilter(id)); existing.is_null()) {
             jsonErrorResponse(res, 404, "Seguimiento no encontrado");
             return;
         }
