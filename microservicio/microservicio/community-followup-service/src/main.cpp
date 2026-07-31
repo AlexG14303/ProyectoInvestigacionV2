@@ -274,7 +274,7 @@ static json completeFollowupWork(const std::shared_ptr<PostgRestClient>& pgClien
     data["evaluation_date"] = body.value("evaluation_date", todayIsoDate());
     if (body.contains("noncompliance_causes")) {
         data["noncompliance_causes"] = body["noncompliance_causes"];
-    } else if (cf_is_noncompliance_status(preparedStatus.c_str())) {
+    } else if (cf_is_noncompliance_status(preparedStatus)) {
         data["noncompliance_causes"] = cf_noncompliance_default_cause("");
     }
     cf::domain::validateIsoDateField(data, "evaluation_date");
@@ -497,13 +497,17 @@ static json batchInsertWork(const std::shared_ptr<PostgRestClient>& pgClient, co
     // Fix S5827: static_cast<std::size_t> ya deja el tipo explícito -> auto.
     const auto chunkSize = static_cast<std::size_t>(std::max(1, cfg.persistChunkSize));
 
-    // Fix S886 ("loop menos propenso a errores"): se documenta la
-    // invariante que garantiza terminación — chunkSize siempre es >= 1
-    // (viene de std::max(1, ...) arriba), así que "start" avanza en cada
-    // vuelta y el bucle no puede volverse infinito.
+    // Fix S886 ("las 3 expresiones del for deben tratar solo de control de
+    // bucle"): se extrae el tamaño a una variable antes del bucle, así la
+    // condición queda como una comparación simple entre dos variables de
+    // control (start, total) en vez de una llamada a .size() en cada
+    // vuelta. Además, chunkSize siempre es >= 1 (viene de std::max(1, ...)
+    // arriba), así que "start" avanza en cada vuelta y el bucle no puede
+    // volverse infinito.
+    const std::size_t total = validRecords.size();
     assert(chunkSize > 0);
-    for (std::size_t start = 0; start < validRecords.size(); start += chunkSize) {
-        const std::size_t end = std::min(start + chunkSize, validRecords.size());
+    for (std::size_t start = 0; start < total; start += chunkSize) {
+        const std::size_t end = std::min(start + chunkSize, total);
         json chunk = json::array();
         for (std::size_t k = start; k < end; ++k) chunk.push_back(validRecords[k]);
 
@@ -517,14 +521,11 @@ static json batchInsertWork(const std::shared_ptr<PostgRestClient>& pgClient, co
             if (insertedChunk.is_array()) {
                 inserted += static_cast<long>(insertedChunk.size());
             } else {
-                // NOSONAR (cpp:S6185, std::format): requiere GCC 13+, no
-                // disponible en el toolchain (ubuntu:22.04 -> GCC 11.4).
-                insertErrors.push_back("Respuesta inesperada insertando el bloque [" +
-                                        std::to_string(start) + ".." + std::to_string(end) + ")");  // NOSONAR
+                // NOSONAR (cpp:S6185, std::format): requiere GCC 13+, no disponible en el toolchain (ubuntu:22.04 -> GCC 11.4).
+                insertErrors.push_back("Respuesta inesperada insertando el bloque [" + std::to_string(start) + ".." + std::to_string(end) + ")");  // NOSONAR
             }
         } catch (const std::exception& e) {  // NOSONAR
-            insertErrors.push_back("Bloque [" + std::to_string(start) + ".." + std::to_string(end) +
-                                    "): " + e.what());  // NOSONAR
+            insertErrors.push_back("Bloque [" + std::to_string(start) + ".." + std::to_string(end) + "): " + e.what());  // NOSONAR
         }
     }
 
