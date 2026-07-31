@@ -53,8 +53,8 @@ BatchProcessResult processBatchCpuPhase(const std::vector<json>& rawRecords, boo
         // NOSONAR (cpp:S1181, "capturar una excepción más específica"):
         // cleanAndValidateFollowup() puede lanzar distintos tipos
         // (std::invalid_argument, std::runtime_error, json::parse_error,
-        // etc.) y el manejo es idéntico para todos — marcar el ítem como
-        // inválido y guardar el mensaje. Capturar std::exception aquí es
+        // etc.) y el manejo es idéntico en cada caso — marcar el ítem
+        // como inválido y guardar el mensaje. Capturar std::exception aquí es
         // el patrón correcto para aislar el fallo de UN registro sin
         // interrumpir el resto del lote; distinguir subtipos no cambiaría
         // la lógica, solo la duplicaría.
@@ -65,8 +65,8 @@ BatchProcessResult processBatchCpuPhase(const std::vector<json>& rawRecords, boo
         // red de seguridad final para cualquier throw que no derive de
         // std::exception (poco común, pero posible en C++). Sin este
         // catch-all, un valor no estándar lanzado por una dependencia
-        // tumbaría todo el hilo OpenMP en vez de marcarse como un solo
-        // ítem inválido.
+        // haría caer el hilo OpenMP completo en vez de marcarse como un
+        // solo ítem inválido.
         } catch (...) {  // NOSONAR
             item.valid = false;
             item.error = "Error desconocido validando el registro";
