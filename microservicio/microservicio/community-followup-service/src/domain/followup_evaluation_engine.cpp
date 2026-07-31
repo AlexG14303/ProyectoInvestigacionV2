@@ -1,5 +1,7 @@
 #include "followup_evaluation_engine.h"
 
+#include "commitment-tracker.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -130,9 +132,14 @@ RuleOutcome evaluateFamilyRule(int local, const RuleContext& ctx) {
         return {};
     }
     local -= kFamilyStrongCount;
-    if (local == 0 && ctx.familyCommitmentLower.empty())
+    // Fix: cf_has_commitment_text() (commitment-tracker.cpp) reimplementaba
+    // exactamente este mismo chequeo de forma independiente y nunca se
+    // usaba desde ningún lado (código muerto, hallazgo R008). Se conecta
+    // aquí, en el lugar para el que fue diseñada, en vez de duplicar la
+    // lógica con .empty() directamente.
+    if (local == 0 && !cf_has_commitment_text(ctx.familyCommitmentLower))
         return {true, 10, -10, "Compromiso familiar no registrado", "Registrar compromiso familiar explícito"};
-    if (local == 1 && !ctx.familyCommitmentLower.empty() && ctx.familyCommitmentLower.size() < 15)
+    if (local == 1 && cf_has_commitment_text(ctx.familyCommitmentLower) && ctx.familyCommitmentLower.size() < 15)
         return {true, 4, -4, "", "Ampliar el detalle del compromiso familiar registrado"};
     return {};
 }
@@ -143,7 +150,7 @@ RuleOutcome evaluateHealthTeamRule(int local, const RuleContext& ctx) {
             return {true, 5, -5, "Compromiso del equipo de salud débil", ""};
         return {};
     }
-    if (ctx.healthTeamCommitmentLower.empty())
+    if (!cf_has_commitment_text(ctx.healthTeamCommitmentLower))
         return {true, 8, -8, "Sin compromiso registrado del equipo de salud",
                 "Asignar responsable de seguimiento en salud"};
     return {};
