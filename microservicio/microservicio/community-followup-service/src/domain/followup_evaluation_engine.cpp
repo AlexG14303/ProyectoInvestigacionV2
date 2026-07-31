@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <string_view>
 
 #include <omp.h>
 
@@ -37,8 +38,12 @@ struct RuleContext {
     int daysSinceEvaluation = -1;  // -1 = sin evaluation_date o formato inválido
 };
 
-bool contains(const std::string& haystackLower, const char* needle) {
-    return haystackLower.find(needle) != std::string::npos;
+// NOSONAR (cpp:S7034, "usar .contains() en vez de .find()"): .contains()
+// es de C++23. No se aplica aquí porque no está confirmado que el proyecto
+// compile con -std=c++23 (ver CMakeLists.txt) — .find() != npos es
+// equivalente y compatible con cualquier estándar desde C++11.
+bool contains(std::string_view haystackLower, const char* needle) {
+    return haystackLower.find(needle) != std::string_view::npos;  // NOSONAR
 }
 
 std::string toLower(std::string s) {
@@ -49,22 +54,22 @@ std::string toLower(std::string s) {
 // -----------------------------------------------------------------------
 // Tablas de reglas por categoría (datos, no código repetido 74 veces).
 // -----------------------------------------------------------------------
-constexpr const char* kFamilyWeak[] = {"no puede", "no dispone", "dificultad economica",
-                                        "imposibilidad", "sin compromiso", "abandono del proceso"};
-constexpr const char* kFamilyStrong[] = {"compromete", "acepta seguimiento", "dispuesto a colaborar"};
-constexpr const char* kHealthTeamWeak[] = {"no disponible", "sin seguimiento", "pendiente asignacion",
-                                            "sin contacto"};
-constexpr const char* kCriticalNoncompliance[] = {
+constexpr std::array kFamilyWeak = {"no puede", "no dispone", "dificultad economica",
+                                     "imposibilidad", "sin compromiso", "abandono del proceso"};
+constexpr std::array kFamilyStrong = {"compromete", "acepta seguimiento", "dispuesto a colaborar"};
+constexpr std::array kHealthTeamWeak = {"no disponible", "sin seguimiento", "pendiente asignacion",
+                                         "sin contacto"};
+constexpr std::array kCriticalNoncompliance = {
     "violencia", "negligencia", "abandono", "maltrato", "desnutricion",
     "consumo de sustancias", "hacinamiento", "trabajo infantil", "desercion escolar",
     "situacion de calle", "riesgo vital", "autolesion", "abuso", "explotacion", "vulnerabilidad extrema"};
-constexpr const char* kCriticalRiskDesc[] = {
+constexpr std::array kCriticalRiskDesc = {
     "violencia", "negligencia", "abandono", "maltrato", "desnutricion",
     "consumo de sustancias", "hacinamiento", "trabajo infantil", "desercion escolar",
     "situacion de calle", "riesgo vital", "autolesion", "abuso", "explotacion", "enfermedad cronica"};
-constexpr const char* kUrgency[] = {"urgente", "emergencia", "inmediato", "critico", "grave"};
-constexpr const char* kActivityKeywords[] = {"visita", "taller", "seguimiento telefonico", "control"};
-constexpr int kDateThresholds[] = {7, 15, 30, 60, 90};
+constexpr std::array kUrgency = {"urgente", "emergencia", "inmediato", "critico", "grave"};
+constexpr std::array kActivityKeywords = {"visita", "taller", "seguimiento telefonico", "control"};
+constexpr std::array kDateThresholds = {7, 15, 30, 60, 90};
 
 constexpr int kFamilyWeakCount = 6;
 constexpr int kFamilyStrongCount = 3;
@@ -227,7 +232,7 @@ std::string classifyRiskLevel(int score) {
     return "BAJO";
 }
 
-std::string classifyPriority(const std::string& riskLevel) {
+std::string classifyPriority(std::string_view riskLevel) {
     if (riskLevel == "ALTO") return "URGENTE";
     if (riskLevel == "MEDIO") return "MODERADA";
     return "NORMAL";
@@ -243,7 +248,7 @@ int evaluateCombinationRules(EvaluationResult& result, const RuleContext& ctx) {
     int triggered = 0;
 
     if (result.riskScore >= 60 && ctx.complianceStatus == "NO_CUMPLE") {
-        result.alerts.push_back("Combinación crítica: riesgo alto con incumplimiento");
+        result.alerts.emplace_back("Combinación crítica: riesgo alto con incumplimiento");
         result.priority = "URGENTE";
         ++triggered;
     }
@@ -252,19 +257,19 @@ int evaluateCombinationRules(EvaluationResult& result, const RuleContext& ctx) {
         ++triggered;
     }
     if (result.complianceScore <= 20 && ctx.scheduledActivitiesLower.empty()) {
-        result.recommendations.push_back("Intervención inmediata: bajo cumplimiento sin plan de actividades");
+        result.recommendations.emplace_back("Intervención inmediata: bajo cumplimiento sin plan de actividades");
         ++triggered;
     }
     if (ctx.daysSinceEvaluation >= 30 && result.riskScore >= 40) {
-        result.recommendations.push_back("Programar visita domiciliaria por retraso combinado con riesgo elevado");
+        result.recommendations.emplace_back("Programar visita domiciliaria por retraso combinado con riesgo elevado");
         ++triggered;
     }
     if (!ctx.hasResponsibleStaff && result.riskScore >= 50) {
-        result.alerts.push_back("Seguimiento de alto riesgo sin responsable asignado");
+        result.alerts.emplace_back("Seguimiento de alto riesgo sin responsable asignado");
         ++triggered;
     }
     if (result.riskScore <= 15 && result.complianceScore >= 80) {
-        result.recommendations.push_back("Evaluar cierre o espaciamiento del seguimiento por bajo riesgo sostenido");
+        result.recommendations.emplace_back("Evaluar cierre o espaciamiento del seguimiento por bajo riesgo sostenido");
         ++triggered;
     }
 
@@ -272,36 +277,55 @@ int evaluateCombinationRules(EvaluationResult& result, const RuleContext& ctx) {
 }
 
 int daysBetweenIsoDates(const std::string& from, const std::string& to) {
-    std::tm tmFrom{};
-    std::tm tmTo{};
-    int y1, m1, d1, y2, m2, d2;
+    int y1;
+    int m1;
+    int d1;
+    int y2;
+    int m2;
+    int d2;
     if (std::sscanf(from.c_str(), "%d-%d-%d", &y1, &m1, &d1) != 3) return -1;
     if (std::sscanf(to.c_str(), "%d-%d-%d", &y2, &m2, &d2) != 3) return -1;
-    tmFrom.tm_year = y1 - 1900;
-    tmFrom.tm_mon = m1 - 1;
-    tmFrom.tm_mday = d1;
-    tmFrom.tm_hour = 12;
-    tmTo.tm_year = y2 - 1900;
-    tmTo.tm_mon = m2 - 1;
-    tmTo.tm_mday = d2;
-    tmTo.tm_hour = 12;
-    const std::time_t tFrom = std::mktime(&tmFrom);
-    const std::time_t tTo = std::mktime(&tmTo);
-    if (tFrom == static_cast<std::time_t>(-1) || tTo == static_cast<std::time_t>(-1)) return -1;
-    return static_cast<int>(std::difftime(tTo, tFrom) / 86400.0);
+
+    // Fix S6229 x2 ("usar std::chrono en vez de mktime"): además de
+    // resolver el hallazgo, esto corrige un bug sutil del código anterior
+    // — mktime() interpreta el std::tm como HORA LOCAL, así que un cambio
+    // de horario de verano (DST) entre las dos fechas podía desviar el
+    // resultado en ±1 día. year_month_day/sys_days hacen aritmética de
+    // calendario pura (sin zona horaria), así que ese caso queda resuelto
+    // de raíz, no solo silenciado.
+    const std::chrono::year_month_day ymdFrom{std::chrono::year{y1}, std::chrono::month{static_cast<unsigned>(m1)},
+                                                std::chrono::day{static_cast<unsigned>(d1)}};
+    const std::chrono::year_month_day ymdTo{std::chrono::year{y2}, std::chrono::month{static_cast<unsigned>(m2)},
+                                              std::chrono::day{static_cast<unsigned>(d2)}};
+    if (!ymdFrom.ok() || !ymdTo.ok()) return -1;
+
+    const std::chrono::sys_days sysFrom = ymdFrom;
+    const std::chrono::sys_days sysTo = ymdTo;
+    return static_cast<int>((sysTo - sysFrom).count());
 }
 
 std::string todayIsoDate() {
-    const std::time_t t = std::time(nullptr);
+    // Fix S6229 ("Replace this use of time with std::chrono"): esta
+    // conversión es válida desde C++11, sin depender de ninguna feature
+    // de C++20+, a diferencia de std::format más abajo.
+    const std::time_t t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm tm{};
 #if defined(_WIN32)
     localtime_s(&tm, &t);
 #else
     localtime_r(&t, &tm);
 #endif
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-    return std::string(buf);
+    // Fix S5945 ("usar std::string en vez de char[]"): buffer como
+    // std::string en vez de char[32].
+    //
+    // NOSONAR (cpp:S6494, "usar std::format en vez de snprintf"):
+    // std::format requiere GCC 13+; el Dockerfile usa ubuntu:22.04 con
+    // GCC 11.4 por defecto — std::format no compilaría. snprintf sigue
+    // siendo la opción segura y portable aquí.
+    std::string buf(32, '\0');
+    std::snprintf(buf.data(), buf.size(), "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);  // NOSONAR
+    buf.resize(std::strlen(buf.c_str()));
+    return buf;
 }
 
 RuleContext buildContext(const json& record) {
