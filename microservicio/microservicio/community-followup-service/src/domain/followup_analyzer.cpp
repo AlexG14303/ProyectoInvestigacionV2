@@ -3,22 +3,26 @@
 namespace cf::domain {
 
 std::string riskLevelLabel(RiskLevel level) {
+    // Fix S6177 ("using enum" para RiskLevel, C++20): el proyecto compila
+    // con CXX_STANDARD 20 (ver CMakeLists.txt).
+    using enum RiskLevel;
     switch (level) {
-        case RiskLevel::Alto:
+        case Alto:
             return "ALTO";
-        case RiskLevel::Medio:
+        case Medio:
             return "MEDIO";
-        case RiskLevel::Bajo:
+        case Bajo:
         default:
             return "BAJO";
     }
 }
 
 RiskLevel classifyRisk(const json& record) {
+    using enum RiskLevel;
     const std::string status = record.value("compliance_status", "PARCIAL");
-    if (status == "NO_CUMPLE") return RiskLevel::Alto;
-    if (status == "SI_CUMPLE") return RiskLevel::Bajo;
-    return RiskLevel::Medio;
+    if (status == "NO_CUMPLE") return Alto;
+    if (status == "SI_CUMPLE") return Bajo;
+    return Medio;
 }
 
 }  // namespace cf::domain
