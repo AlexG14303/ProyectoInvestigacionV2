@@ -44,7 +44,6 @@
 // comparte vía shared_ptr) — si en el futuro se crea más de una instancia,
 // esta estrategia thread_local tendría que revisarse.
 // ─────────────────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
 // Excepción dedicada para errores de PostgRestClient, en vez de lanzar
 // std::runtime_error genérico directamente. Esto permite que el código que
 // llama distinga "algo falló hablando con PostgREST" de cualquier otro
@@ -52,7 +51,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 class PostgRestError : public std::runtime_error {
 public:
-    explicit PostgRestError(const std::string& message) : std::runtime_error(message) {}
+    using std::runtime_error::runtime_error;
 };
 
 class PostgRestClient {
@@ -63,7 +62,7 @@ public:
           connectTimeoutSec_(connectTimeoutSec), readWriteTimeoutSec_(readWriteTimeoutSec) {}
 
     // GET /{table}?{query}  →  array JSON
-    nlohmann::json getAll(const std::string& table, const std::string& query = "") {
+    nlohmann::json getAll(const std::string& table, const std::string& query = "") const {
         httplib::Client& cli = clientForThisThread();
         std::string path = "/" + table + (query.empty() ? "" : "?" + query);
         auto res = cli.Get(path, baseHeaders());
@@ -72,7 +71,7 @@ public:
     }
 
     // GET /{table}?{query}&limit=1  →  objeto JSON o null
-    nlohmann::json getOne(const std::string& table, const std::string& query) {
+    nlohmann::json getOne(const std::string& table, const std::string& query) const {
         httplib::Client& cli = clientForThisThread();
         std::string path = "/" + table + "?" + query + "&limit=1";
         auto res = cli.Get(path, baseHeaders());
@@ -83,20 +82,13 @@ public:
     }
 
     // POST /{table}  →  objeto insertado (con id generado)
-    nlohmann::json insert(const std::string& table, const nlohmann::json& data) {
+    nlohmann::json insert(const std::string& table, const nlohmann::json& data) const {
         httplib::Client& cli = clientForThisThread();
         httplib::Headers h = baseHeaders();
         h.emplace("Prefer", "return=representation");
         auto res = cli.Post("/" + table, h, data.dump(), "application/json");
         if (!res || (res->status != 200 && res->status != 201)) {
-            // NOSONAR (std::format, S6185): requiere GCC 13+; el Dockerfile
-            // usa ubuntu:22.04, que trae GCC 11.4 por defecto — std::format
-            // no compilaría. Se mantiene la concatenación manual.
-            throw PostgRestError(
-                "PostgREST insert error [" + table + "]: " +
-                (res ? std::to_string(res->status) + " — " + res->body  // NOSONAR
-                     : "sin respuesta (timeout o conexión rechazada tras " +
-                           std::to_string(connectTimeoutSec_) + "s)"));  // NOSONAR
+            throw PostgRestError(formatHttpError("PostgREST insert error", table, res));
         }
         auto result = nlohmann::json::parse(res->body);
         if (result.is_array() && !result.empty()) return result[0];
@@ -109,25 +101,19 @@ public:
     // validados/normalizados y los inserta en una sola llamada HTTP,
     // aprovechando el soporte nativo de PostgREST para bulk insert vía
     // arreglo en el body.
-    nlohmann::json insertMany(const std::string& table, const nlohmann::json& dataArray) {
+    nlohmann::json insertMany(const std::string& table, const nlohmann::json& dataArray) const {
         httplib::Client& cli = clientForThisThread();
         httplib::Headers h = baseHeaders();
         h.emplace("Prefer", "return=representation");
         auto res = cli.Post("/" + table, h, dataArray.dump(), "application/json");
         if (!res || (res->status != 200 && res->status != 201)) {
-            // NOSONAR (std::format, S6185): mismo motivo que en insert() —
-            // GCC 11.4 (Ubuntu 22.04) no soporta std::format.
-            throw PostgRestError(
-                "PostgREST bulk insert error [" + table + "]: " +
-                (res ? std::to_string(res->status) + " — " + res->body  // NOSONAR
-                     : "sin respuesta (timeout o conexión rechazada tras " +
-                           std::to_string(connectTimeoutSec_) + "s)"));  // NOSONAR
+            throw PostgRestError(formatHttpError("PostgREST bulk insert error", table, res));
         }
         return nlohmann::json::parse(res->body);
     }
 
     // PATCH /{table}?{query}  →  true si OK
-    bool update(const std::string& table, const std::string& query, const nlohmann::json& data) {
+    bool update(const std::string& table, const std::string& query, const nlohmann::json& data) const {
         httplib::Client& cli = clientForThisThread();
         httplib::Headers h = baseHeaders();
         h.emplace("Prefer", "return=minimal");
@@ -136,7 +122,7 @@ public:
     }
 
     // DELETE /{table}?{query}  →  true si OK
-    bool remove(const std::string& table, const std::string& query) {
+    bool remove(const std::string& table, const std::string& query) const {
         httplib::Client& cli = clientForThisThread();
         auto res = cli.Delete("/" + table + "?" + query, baseHeaders());
         return res && (res->status == 200 || res->status == 204);
@@ -147,6 +133,22 @@ private:
     int         port_;
     int         connectTimeoutSec_;
     int         readWriteTimeoutSec_;
+
+    // Arma el mensaje de error para respuestas HTTP fallidas de PostgREST.
+    // Se usa una función dedicada (en vez de concatenar en línea dentro de
+    // cada throw) para que cada rama de construcción del mensaje quede en
+    // una sola línea física — así el análisis estático que reporta la
+    // concatenación manual apunta siempre a la misma línea donde está su
+    // justificación documentada.
+    //
+    // NOSONAR (std::format, cpp:S6185): requiere GCC 13+; el Dockerfile usa
+    // ubuntu:22.04, que trae GCC 11.4 por defecto — std::format no
+    // compilaría con ese toolchain. Se mantiene la concatenación manual.
+    std::string formatHttpError(const std::string& prefix, const std::string& table,
+                                 const httplib::Result& res) const {
+        if (res) return prefix + " [" + table + "]: " + std::to_string(res->status) + " — " + res->body;  // NOSONAR
+        return prefix + " [" + table + "]: sin respuesta (timeout o conexión rechazada tras " + std::to_string(connectTimeoutSec_) + "s)";  // NOSONAR
+    }
 
     httplib::Headers baseHeaders() const {
         return {
