@@ -67,7 +67,13 @@ foreach ($lvl in $levels) {
             $candidate = Invoke-RestMethod -Uri "$BaseUrl/health" -Method Get -TimeoutSec 3
             if ($candidate.status -eq "ok") { $health = $candidate; break }
         }
-        catch { }
+        catch {
+            # Esperado mientras el contenedor sigue arrancando: la conexión
+            # falla (rechazada / timeout) hasta que el servicio queda
+            # listo. Se reintenta en silencio; solo se deja traza a nivel
+            # debug para no ensuciar la salida normal del script.
+            Write-Verbose "Intento $($i + 1)/30 para el nivel ${label}: /health aún no responde ($($_.Exception.Message))"
+        }
     }
 
     if ($null -eq $health) {
