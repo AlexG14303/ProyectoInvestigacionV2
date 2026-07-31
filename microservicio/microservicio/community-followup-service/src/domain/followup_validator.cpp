@@ -53,7 +53,11 @@ void validateStatus(const json& data) {
     std::string error(160, '\0');
     const std::string status = data["compliance_status"].get<std::string>();
     if (!cf_validate_compliance_status(status.c_str(), error.data(), error.size())) {
-        error.resize(std::strlen(error.c_str()));
+        // NOSONAR (cpp:S5813): "error" parte en 160 bytes '\0' y se pasa
+        // junto con error.size(), así que cf_validate_compliance_status
+        // nunca puede escribir más allá del buffer; strlen() no puede
+        // leer fuera de sus límites.
+        error.resize(std::strlen(error.c_str()));  // NOSONAR
         throw std::invalid_argument(error);
     }
 }
@@ -66,7 +70,9 @@ void validateDate(const json& data, const char* field) {
     std::string error(160, '\0');
     const std::string date = data[field].get<std::string>();
     if (!cf_validate_iso_date(date.c_str(), error.data(), error.size())) {
-        error.resize(std::strlen(error.c_str()));
+        // NOSONAR (cpp:S5813): mismo motivo que en validateStatus — buffer
+        // inicializado en ceros y tamaño real pasado explícitamente.
+        error.resize(std::strlen(error.c_str()));  // NOSONAR
         throw std::invalid_argument(error);
     }
 }
@@ -91,10 +97,25 @@ json cleanAndValidateFollowup(const json& input, bool partialUpdate) {
 
     if (!partialUpdate) {
         std::string error(160, '\0');
-        if (const int hasFamilyId = data.contains("family_id") && !data["family_id"].is_null(),
-                      hasRecordNumber = data.contains("record_number") && !data["record_number"].is_null();
-            !cf_validate_required_create(hasFamilyId, hasRecordNumber, error.data(), error.size())) {
-            error.resize(std::strlen(error.c_str()));
+        // Fix S1659/S6004 (estas dos reglas se contradicen entre sí para
+        // este caso: una pide mover las variables al init-statement del
+        // if, la otra pide declarar cada identificador por separado — no
+        // es posible satisfacer ambas a la vez con variables nombradas).
+        // Se resuelve evaluando las condiciones directamente como
+        // argumentos, sin declarar variables intermedias.
+        //
+        // NOSONAR (cpp:S5813, "verificar que el uso de strlen sea
+        // seguro"): "error" se inicializa con 160 bytes en '\0' ANTES de
+        // pasarlo a cf_validate_required_create junto con su tamaño real
+        // (error.size()), así que la función C nunca puede escribir más
+        // allá del buffer. En el peor caso (mensaje de error que no cabe),
+        // el buffer sigue null-terminado porque partió completamente en
+        // ceros. strlen() no puede leer fuera de los límites del buffer.
+        if (!cf_validate_required_create(
+                data.contains("family_id") && !data["family_id"].is_null(),
+                data.contains("record_number") && !data["record_number"].is_null(),
+                error.data(), error.size())) {
+            error.resize(std::strlen(error.c_str()));  // NOSONAR
             throw std::invalid_argument(error);
         }
         if (!data.contains("compliance_status")) {
