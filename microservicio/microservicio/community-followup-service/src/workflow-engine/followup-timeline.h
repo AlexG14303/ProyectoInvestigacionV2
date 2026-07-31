@@ -2,7 +2,9 @@
 #define FOLLOWUP_TIMELINE_H
 
 #include <string>
+#include <string_view>
 
-std::string cf_timeline_state_label(const std::string& compliance_status);
+// Fix S6009: mismo motivo que en commitment-tracker.h.
+std::string cf_timeline_state_label(std::string_view compliance_status);
 
 #endif
