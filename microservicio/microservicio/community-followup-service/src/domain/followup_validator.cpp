@@ -96,13 +96,16 @@ json cleanAndValidateFollowup(const json& input, bool partialUpdate) {
     }
 
     if (!partialUpdate) {
-        std::string error(160, '\0');
-        // Fix S1659/S6004 (estas dos reglas se contradicen entre sí para
-        // este caso: una pide mover las variables al init-statement del
-        // if, la otra pide declarar cada identificador por separado — no
-        // es posible satisfacer ambas a la vez con variables nombradas).
-        // Se resuelve evaluando las condiciones directamente como
-        // argumentos, sin declarar variables intermedias.
+        // Fix S1659/S6004 (para las condiciones hasFamilyId/hasRecordNumber:
+        // estas dos reglas se contradicen entre sí — una pide moverlas al
+        // init-statement del if, la otra pide declarar cada identificador
+        // por separado — no es posible satisfacer ambas a la vez con
+        // variables nombradas). Se resuelve evaluando esas condiciones
+        // directamente como argumentos, sin declararlas.
+        //
+        // "error" sí se mueve al init-statement (Fix S6004): al ser una
+        // única variable, no choca con S1659 como sí pasaba con el par
+        // hasFamilyId/hasRecordNumber.
         //
         // NOSONAR (cpp:S5813, "verificar que el uso de strlen sea
         // seguro"): "error" se inicializa con 160 bytes en '\0' ANTES de
@@ -111,7 +114,8 @@ json cleanAndValidateFollowup(const json& input, bool partialUpdate) {
         // allá del buffer. En el peor caso (mensaje de error que no cabe),
         // el buffer sigue null-terminado porque partió completamente en
         // ceros. strlen() no puede leer fuera de los límites del buffer.
-        if (!cf_validate_required_create(
+        if (std::string error(160, '\0');
+            !cf_validate_required_create(
                 data.contains("family_id") && !data["family_id"].is_null(),
                 data.contains("record_number") && !data["record_number"].is_null(),
                 error.data(), error.size())) {
